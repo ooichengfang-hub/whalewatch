@@ -166,3 +166,72 @@ test('btcTxValue sums outputs in BTC; change1h uses last 4 x 15m klines', () => 
   const kl = [{ o: 1, c: 1 }, { o: 90, c: 95 }, { o: 100, c: 101 }, { o: 101, c: 104 }, { o: 104, c: 105 }, { o: 105, c: 110 }];
   assert.ok(Math.abs(WW.change1h(kl) - 10) < 1e-9); assert.ok(isNaN(WW.change1h(kl.slice(0, 3))));
 });
+
+// ---------- chart: liquidation-level model and marker store ----------
+test('liqPrice: long/short liquidation prices for 10x/25x/50x/100x with 0.4% mmr', () => {
+  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, a + ' vs ' + b);
+  near(WW.liqPrice(100000, 10, 'long'), 100000 * (1 - 0.1 + 0.004));   // 90,400
+  near(WW.liqPrice(100000, 10, 'short'), 100000 * (1 + 0.1 - 0.004));  // 109,600
+  near(WW.liqPrice(100000, 100, 'long'), 99400); near(WW.liqPrice(100000, 100, 'short'), 100600);
+  near(WW.liqPrice(2000, 25, 'long', 0), 1920); near(WW.liqPrice(2000, 50, 'short', 0.005), 2030);
+  assert.ok(WW.liqPrice(1, 50, 'long') < 1 && WW.liqPrice(1, 50, 'short') > 1);
+  assert.deepStrictEqual([...WW.LEVS], [10, 25, 50, 100]); assert.strictEqual(WW.MMR, 0.004);
+});
+test('liqLevels: buys -> long levels below, sells -> short levels above, value split across leverages', () => {
+  const lv = WW.liqLevels([{ t: 0, p: 100, u: 4e6, s: 'b' }, { t: 0, p: 100, u: 2e6, s: 's' }, { t: 0, p: 100, u: 9e9, s: 'L' }]);
+  assert.strictEqual(lv.length, 8);
+  const longs = lv.filter(l => l.side === 'long'), shorts = lv.filter(l => l.side === 'short');
+  assert.ok(longs.every(l => l.price < 100 && l.usd === 1e6)); assert.ok(shorts.every(l => l.price > 100 && l.usd === 5e5));
+  assert.deepStrictEqual([...longs.map(l => l.lev)], [10, 25, 50, 100]);
+});
+test('liqLevels drops levels already traded through after the order', () => {
+  const iv = 60e3, cs = [{ t: 0, h: 101, l: 99 }, { t: 60e3, h: 100.5, l: 98.5 }, { t: 120e3, h: 100.2, l: 99.8 }];
+  // buy at 100 during candle 0: 100x long liq = 99.4 -> candle 1 low 98.5 hits it; 50x = 98.4 survives
+  const lv = WW.liqLevels([{ t: 10e3, p: 100, u: 4e6, s: 'b' }], { candles: cs, ivMs: iv });
+  assert.deepStrictEqual([...lv.map(l => l.lev)], [10, 25, 50]);
+  // a sell during the last candle is not checked against anything (nothing after it)
+  assert.strictEqual(WW.liqLevels([{ t: 130e3, p: 100, u: 4e6, s: 's' }], { candles: cs, ivMs: iv }).length, 4);
+  // an order before the first candle is checked against all candles (short 100x liq = 100.6 < high 101)
+  assert.deepStrictEqual([...WW.liqLevels([{ t: -5e3, p: 100, u: 4e6, s: 's' }], { candles: cs, ivMs: iv }).map(l => l.lev)], [10, 25, 50]);
+});
+test('heatBins aggregates level value into price bins', () => {
+  const bins = WW.heatBins([{ price: 90.5, usd: 1, side: 'long' }, { price: 90.9, usd: 2, side: 'long' }, { price: 109, usd: 5, side: 'short' }, { price: 200, usd: 9, side: 'short' }], 90, 110, 20);
+  assert.strictEqual(bins.length, 20); assert.strictEqual(bins[0].long, 3); assert.strictEqual(bins[19].short, 5);
+  assert.strictEqual(bins.reduce((a, b) => a + b.long + b.short, 0), 8);
+  assert.strictEqual(WW.heatBins([{ price: 1, usd: 1, side: 'long' }], 5, 5, 4).every(b => b.long === 0), true);
+});
+test('compact markers keep time, price, value, side and market', () => {
+  const o = { sym: 'BTCUSDT', venue: 'F', side: 'sell', qty: 10, usd: 1000000.4, t0: T0 };
+  assert.deepStrictEqual({ ...WW.compactWhale(o) }, { t: T0, p: 100000.04, u: 1000000, s: 's', v: 'F', q: 10 });
+  assert.deepStrictEqual({ ...WW.compactLiq({ sym: 'ETHUSDT', T: T0, side: 'long', price: 2000, qty: 3, usd: 6000 }) }, { t: T0, p: 2000, u: 6000, s: 'L', q: 3 });
+  assert.strictEqual(WW.compactLiq({ T: 1, side: 'short', price: 1, qty: 1, usd: 1 }).s, 'S');
+});
+test('marker store: kept time-ordered, capped per coin and to 7 days', () => {
+  const now = T0, list = [];
+  for (let i = 0; i < 2500; i++) WW.addMarker(list, { t: now - 2500e3 + i * 1000, p: 1, u: 1, s: 'b' }, now);
+  assert.strictEqual(list.length, WW.MK_CAP); assert.strictEqual(list[list.length - 1].t, now - 1000);
+  WW.addMarker(list, { t: now - 5e5 + 1, p: 1, u: 2, s: 's' }, now); // out-of-order insert
+  assert.ok(list.every((m, i) => i === 0 || list[i - 1].t <= m.t)); assert.strictEqual(list.length, 2000);
+  const old = [{ t: now - 8 * 864e5, p: 1, u: 1, s: 'b' }, { t: now - 6 * 864e5, p: 1, u: 1, s: 'b' }];
+  WW.pruneMarkers(old, now); assert.strictEqual(old.length, 1);
+  const small = []; for (let i = 0; i < 20; i++) WW.addMarker(small, { t: i, p: 1, u: 1, s: 'b' }, 20, 5); assert.strictEqual(small.length, 5); assert.strictEqual(small[0].t, 15);
+});
+test('parseMarkers restores from localStorage JSON, drops junk, sorts and applies caps', () => {
+  const now = T0;
+  const json = JSON.stringify([{ t: now - 1000, p: 2, u: 5, s: 's' }, { t: now - 2000, p: 1, u: 5, s: 'b' }, { t: 'x', p: 1, u: 1, s: 'b' }, null, { t: now - 9 * 864e5, p: 1, u: 1, s: 'b' }, { t: now, p: 0, u: 1, s: 'b' }]);
+  const a = WW.parseMarkers(json, now); assert.deepStrictEqual([...a.map(m => m.t)], [now - 2000, now - 1000]);
+  assert.deepStrictEqual([...WW.parseMarkers('not json', now)], []); assert.deepStrictEqual([...WW.parseMarkers('{"a":1}', now)], []);
+  const many = JSON.stringify(Array.from({ length: 3000 }, (_, i) => ({ t: now - i, p: 1, u: 1, s: 'L' })));
+  assert.strictEqual(WW.parseMarkers(many, now).length, 2000);
+  // round trip
+  const rt = WW.parseMarkers(JSON.stringify(a), now); assert.deepStrictEqual(JSON.parse(JSON.stringify(rt)), JSON.parse(JSON.stringify(a)));
+});
+test('markerRadius, candleNet and niceStep', () => {
+  assert.strictEqual(WW.markerRadius(1e5, 1e5), 7); assert.strictEqual(WW.markerRadius(0, 1e5), 3); assert.strictEqual(WW.markerRadius(1e12, 1), 18);
+  assert.ok(WW.markerRadius(5e5, 1e5) > WW.markerRadius(2e5, 1e5));
+  const cs = [{ t: 0 }, { t: 60e3 }, { t: 120e3 }];
+  const net = WW.candleNet([{ t: 1, u: 5, s: 'b' }, { t: 59999, u: 2, s: 's' }, { t: 60e3, u: 4, s: 's' }, { t: 999e3, u: 9, s: 'b' }, { t: 130e3, u: 7, s: 'L' }], cs, 60e3);
+  assert.deepStrictEqual([...net], [3, -4, 0]);
+  assert.strictEqual(WW.niceStep(1000, 5), 200); assert.strictEqual(WW.niceStep(7, 6), 1); assert.strictEqual(WW.niceStep(0.03, 6), 0.005);
+  assert.strictEqual(WW.IVMS['4h'], 144e5);
+});
